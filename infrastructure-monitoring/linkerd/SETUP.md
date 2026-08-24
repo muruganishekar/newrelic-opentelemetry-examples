@@ -1,4 +1,4 @@
-# Linkerd + OTel Observability — Setup Guide
+# Linkerd + New Relic OTel Observability — Setup Guide
 
 This guide walks through instrumenting a Linkerd service mesh to send metrics, traces,
 and logs to New Relic using OpenTelemetry. Two paths are covered:
@@ -132,8 +132,8 @@ kubectl -n nr-otel create secret generic nr-license \
 Use `otel-collector-production.yaml` for all deployments.
 
 ```bash
-# 1. Edit CLUSTER_NAME and uncomment the resourcedetection detector for your cloud provider
-#    (see inline comments in the file: eks / gke / azure / system)
+# 1. Set your cluster name in the OTEL_RESOURCE_ATTRIBUTES env var in the Deployment
+#    (see inline comments in the file)
 # 2. Apply
 kubectl apply -f otel-force-runs/linkerd/otel-collector-production.yaml
 kubectl rollout status deployment/nr-otel-collector -n nr-otel
@@ -143,8 +143,8 @@ kubectl rollout status deployment/nr-otel-collector -n nr-otel
 
 | Field | Location | What to set |
 |---|---|---|
-| `CLUSTER_NAME` | Deployment env | Your cluster name (e.g. `prod-us-east`) |
-| `resourcedetection.detectors` | ConfigMap | Uncomment `eks`, `gke`, or `azure` for your cloud |
+| `OTEL_RESOURCE_ATTRIBUTES` | Deployment env | `k8s.cluster.name=<your-cluster>` — read by `env` resourcedetection detector |
+| `resourcedetection.detectors` | ConfigMap | Optional: add `eks`/`gke`/`azure` for extra cloud attributes (requires IAM on EKS) |
 | Docker volume (optional) | Deployment volumes | Uncomment `/var/lib/docker/containers` if nodes use Docker runtime |
 | `kube-state-metrics` target | ConfigMap scrape_configs | Update namespace/name if KSM is not in `kube-system` |
 

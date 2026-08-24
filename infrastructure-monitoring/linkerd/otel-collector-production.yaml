@@ -10,19 +10,20 @@
 #        --from-literal=NEWRELIC_OTLP_ENDPOINT='https://otlp.nr-data.net:443'
 #        # EU:      https://otlp.eu01.nr-data.net:443
 #
-#   2. Set CLUSTER_NAME in the Deployment env section below.
+#   2. Set your cluster name in the Deployment env section below:
+#              - { name: OTEL_RESOURCE_ATTRIBUTES, value: "k8s.cluster.name=<your-cluster>" }
+#      The `env` resourcedetection detector reads OTEL_RESOURCE_ATTRIBUTES automatically.
+#      Works on ALL cluster types (EKS, GKE, AKS, self-managed) — no IAM permissions needed.
+#      For additional cloud attributes (cloud.provider, cloud.region), optionally add:
+#              detectors: [env, eks]   # EKS — needs ec2:DescribeInstances IAM permission
+#              detectors: [env, gke]   # GKE
+#              detectors: [env, azure] # AKS
 #
-#   3. Set CONTAINER_LOG_PATH for your container runtime:
-#      - containerd (EKS, GKE, AKS, most prod clusters): no extra mount needed —
-#        /var/log/pods symlinks are self-contained.  Set CONTAINER_RUNTIME=containerd.
-#      - Docker (colima, Docker Desktop): also mount /var/lib/docker/containers.
-#        Set CONTAINER_RUNTIME=docker and uncomment the docker volume/mount below.
+#   3. Docker runtime only: uncomment the /var/lib/docker/containers volume/mount below.
 #
 # NOTE — Linkerd proxy trace export (Linkerd 2.19+):
-#   As of Linkerd 2.19, the Linkerd-Jaeger extension is deprecated. Linkerd proxy
-#   traces are now sent directly to this collector on port 4317 through the mesh
-#   (Linkerd mTLS handles security — no cert-manager or port 5317 needed).
-#   To enable, upgrade Linkerd after applying this manifest:
+#   Linkerd proxy traces are sent to port 4317 through the mesh (no cert-manager needed).
+#   To enable after applying this manifest:
 #
 #     linkerd upgrade \
 #       --set proxy.tracing.enabled=true \
@@ -31,10 +32,7 @@
 #       --set proxy.tracing.collector.meshIdentity.namespace=nr-otel \
 #       | kubectl apply -f -
 #
-#   Then restart all meshed pods:
-#     kubectl rollout restart deployment -n <YOUR_NAMESPACE>
-#
-#   Applications must propagate w3c or b3 trace headers for proxy spans to appear.
+#   Then restart all meshed pods and ensure apps propagate w3c/b3 trace headers.
 #   See: https://linkerd.io/2.19/tasks/distributed-tracing/
 ---
 apiVersion: v1
@@ -97,8 +95,6 @@ data:
               static_configs:
                 - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
               metric_relabel_configs:
-                - target_label: k8s.cluster.name
-                  replacement: "${env:CLUSTER_NAME}"
                 - { source_labels: [deployment], target_label: k8s.deployment.name, regex: (.+) }
                 - { source_labels: [pod], target_label: k8s.pod.name, regex: (.+) }
                 - { source_labels: [node], target_label: k8s.node.name, regex: (.+) }
@@ -113,7 +109,6 @@ data:
       # no separate receiver needed. See header comment for how to enable.
 
       # LOGS: tail node pod logs via the CRI log path.
-      # The `container` operator parses CRI format and extracts k8s metadata from the file path.
       filelog:
         include: [ /var/log/pods/*/*/*.log ]
         include_file_path: true
@@ -152,7 +147,6 @@ data:
             - { tag_name: linkerd_control_plane_ns, key: linkerd.io/control-plane-ns, from: pod }
             - { tag_name: linkerd_control_plane_component, key: linkerd.io/control-plane-component, from: pod }
         pod_association:
-          # k8s.pod.ip set via downward API env var in the app pod (see APM setup)
           - sources: [{ from: resource_attribute, name: k8s.pod.ip }]
           - sources: [{ from: connection }]
 
@@ -163,31 +157,23 @@ data:
           log_record:
             - 'resource.attributes["k8s.container.name"] != "linkerd-proxy" and not IsMatch(resource.attributes["linkerd_control_plane_component"], ".+")'
 
-      resource/cluster:
-        attributes:
-          - { key: k8s.cluster.name, value: "${env:CLUSTER_NAME}", action: upsert }
-
       # Strip service.name from Prometheus metrics to prevent spurious EXT:SERVICE entities
       resource/strip_service:
         attributes:
           - { key: service.name, action: delete }
           - { key: service.instance.id, action: delete }
 
-      # Cloud-specific resource detection — uncomment ONE block matching your environment
+      # Resource detection — reads cloud metadata and the OTEL_RESOURCE_ATTRIBUTES env var.
+      # k8s.cluster.name is set via OTEL_RESOURCE_ATTRIBUTES in the Deployment (see below).
+      # Optionally add cloud-specific detectors to also get cloud.provider, cloud.region, etc:
+      #   EKS (requires ec2:DescribeInstances IAM): detectors: [env, eks]
+      #   GKE:   detectors: [env, gke]
+      #   AKS:   detectors: [env, azure]
       resourcedetection:
         detectors: [env]
-        # --- EKS ---
-        # detectors: [env, eks]
-        # --- GKE ---
-        # detectors: [env, gke]
-        # --- AKS ---
-        # detectors: [env, azure]
-        # --- Generic / self-managed K8s ---
-        # detectors: [env, system]
         override: false
 
-      # Copy Prometheus label namespace → k8s.namespace.name (needed for entity synthesis
-      # and the EXT:LINKERD MANAGES KUBERNETES_DEPLOYMENT relationship rule)
+      # Copy Prometheus label namespace → k8s.namespace.name (needed for entity synthesis)
       transform/k8s:
         metric_statements:
           - context: datapoint
@@ -243,24 +229,24 @@ data:
         # Linkerd proxy + kube-state-metrics: strip service.name to avoid spurious entities
         metrics/prometheus:
           receivers: [prometheus]
-          processors: [memory_limiter, resource/cluster, resource/strip_service, resourcedetection, transform/k8s, transform/deployment, transform/metadata_nullify, batch]
+          processors: [memory_limiter, resource/strip_service, resourcedetection, transform/k8s, transform/deployment, transform/metadata_nullify, batch]
           exporters: [otlphttp]
 
         # App OTLP metrics (OTel SDK): preserve service.name for APM golden metrics
         metrics/otlp:
           receivers: [otlp]
-          processors: [memory_limiter, resource/cluster, resourcedetection, transform/metadata_nullify, metricstransform/apm_compat, batch]
+          processors: [memory_limiter, resourcedetection, transform/metadata_nullify, metricstransform/apm_compat, batch]
           exporters: [otlphttp]
 
         # App traces + Linkerd proxy traces (2.19+) both arrive on port 4317
         traces:
           receivers: [otlp]
-          processors: [memory_limiter, k8sattributes/traces, resource/cluster, transform/linkerd_service_name, batch]
+          processors: [memory_limiter, k8sattributes/traces, resourcedetection, transform/linkerd_service_name, batch]
           exporters: [otlphttp]
 
         logs:
           receivers: [filelog]
-          processors: [memory_limiter, k8sattributes, resource/cluster, filter/onlyproxy, batch]
+          processors: [memory_limiter, k8sattributes, resourcedetection, filter/onlyproxy, batch]
           exporters: [otlphttp]
 ---
 apiVersion: apps/v1
@@ -281,8 +267,9 @@ spec:
           image: otel/opentelemetry-collector-contrib:0.119.0
           args: ["--config=/etc/otel/config.yaml"]
           env:
-            # !! SET THIS to your cluster name !!
-            - { name: CLUSTER_NAME, value: "<YOUR_CLUSTER_NAME>" }
+            # Set your cluster name here — read by the `env` resourcedetection detector.
+            # Used by entity synthesis to scope all entities (EXT:LINKERD, KUBERNETES_DEPLOYMENT, etc.)
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: "k8s.cluster.name=<YOUR_CLUSTER_NAME>" }
             - name: YOUR_NEWRELIC_OTLP_ENDPOINT
               valueFrom: { secretKeyRef: { name: nr-license, key: NEWRELIC_OTLP_ENDPOINT } }
             - name: YOUR_NEW_RELIC_LICENSE_KEY
@@ -300,11 +287,9 @@ spec:
             # CRI log path — present on ALL runtimes (containerd, Docker, CRI-O)
             - { name: varlogpods, mountPath: /var/log/pods, readOnly: true }
             # Docker only: symlink target for /var/log/pods entries.
-            # Uncomment if your nodes use Docker (uncommon in managed clusters).
             # - { name: varlibdockercontainers, mountPath: /var/lib/docker/containers, readOnly: true }
       volumes:
         - { name: cfg, configMap: { name: nr-otel-config } }
-        # Present on ALL container runtimes
         - { name: varlogpods, hostPath: { path: /var/log/pods } }
         # Docker only — uncomment if needed
         # - { name: varlibdockercontainers, hostPath: { path: /var/lib/docker/containers } }
