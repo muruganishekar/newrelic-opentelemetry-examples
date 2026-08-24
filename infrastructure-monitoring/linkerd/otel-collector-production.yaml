@@ -1,0 +1,321 @@
+# OTel Collector for Linkerd -> New Relic (Production)
+#
+# BEFORE APPLYING:
+#   1. Create the namespace and license secret:
+#
+#      kubectl create namespace nr-otel
+#
+#      kubectl -n nr-otel create secret generic nr-license \
+#        --from-literal=NEW_RELIC_LICENSE_KEY='<YOUR_NR_INGEST_LICENSE_KEY>' \
+#        --from-literal=NEWRELIC_OTLP_ENDPOINT='https://otlp.nr-data.net:443'
+#        # EU:      https://otlp.eu01.nr-data.net:443
+#
+#   2. Set CLUSTER_NAME in the Deployment env section below.
+#
+#   3. Set CONTAINER_LOG_PATH for your container runtime:
+#      - containerd (EKS, GKE, AKS, most prod clusters): no extra mount needed —
+#        /var/log/pods symlinks are self-contained.  Set CONTAINER_RUNTIME=containerd.
+#      - Docker (colima, Docker Desktop): also mount /var/lib/docker/containers.
+#        Set CONTAINER_RUNTIME=docker and uncomment the docker volume/mount below.
+#
+# NOTE — Linkerd proxy trace export (Linkerd 2.19+):
+#   As of Linkerd 2.19, the Linkerd-Jaeger extension is deprecated. Linkerd proxy
+#   traces are now sent directly to this collector on port 4317 through the mesh
+#   (Linkerd mTLS handles security — no cert-manager or port 5317 needed).
+#   To enable, upgrade Linkerd after applying this manifest:
+#
+#     linkerd upgrade \
+#       --set proxy.tracing.enabled=true \
+#       --set proxy.tracing.collector.endpoint=nr-otel-collector.nr-otel.svc.cluster.local:4317 \
+#       --set proxy.tracing.collector.meshIdentity.serviceAccountName=nr-otel-collector \
+#       --set proxy.tracing.collector.meshIdentity.namespace=nr-otel \
+#       | kubectl apply -f -
+#
+#   Then restart all meshed pods:
+#     kubectl rollout restart deployment -n <YOUR_NAMESPACE>
+#
+#   Applications must propagate w3c or b3 trace headers for proxy spans to appear.
+#   See: https://linkerd.io/2.19/tasks/distributed-tracing/
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: nr-otel-collector, namespace: nr-otel }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: nr-otel-collector }
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, endpoints, services, namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: ["apps"]
+    resources: [replicasets, deployments, daemonsets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: nr-otel-collector }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: nr-otel-collector }
+subjects:
+  - { kind: ServiceAccount, name: nr-otel-collector, namespace: nr-otel }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: nr-otel-config, namespace: nr-otel }
+data:
+  config.yaml: |
+    receivers:
+      prometheus:
+        config:
+          scrape_configs:
+            # Scrape Linkerd control plane component metrics (destination, identity, proxy-injector)
+            - job_name: 'linkerd-controller'
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces: { names: ['linkerd', 'linkerd-viz'] }
+              relabel_configs:
+                - { source_labels: [__meta_kubernetes_pod_container_port_name], action: keep, regex: admin-http }
+                - { source_labels: [__meta_kubernetes_pod_container_name], target_label: component }
+                - { source_labels: [__meta_kubernetes_namespace], target_label: namespace }
+                - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+
+            # Scrape Linkerd proxy sidecar metrics from ALL meshed pods (:4191 admin port)
+            - job_name: 'linkerd-proxy'
+              kubernetes_sd_configs: [{ role: pod }]
+              relabel_configs:
+                - { source_labels: [__meta_kubernetes_pod_container_name, __meta_kubernetes_pod_container_port_name, __meta_kubernetes_pod_label_linkerd_io_control_plane_ns], action: keep, regex: ^linkerd-proxy;linkerd-admin;linkerd$$ }
+                - { source_labels: [__meta_kubernetes_namespace], target_label: namespace }
+                - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+                # Injector-set pod label — gates entity synthesis and relationship rules
+                - { source_labels: [__meta_kubernetes_pod_label_linkerd_io_control_plane_ns], target_label: linkerd_control_plane_ns }
+                # Only present on CP pods (destination/identity/proxy-injector)
+                - { source_labels: [__meta_kubernetes_pod_label_linkerd_io_control_plane_component], target_label: linkerd_control_plane_component }
+
+            # kube-state-metrics — drives KUBERNETES_DEPLOYMENT / KUBERNETES_POD entity synthesis
+            # Update namespace/service name if kube-state-metrics is installed elsewhere
+            - job_name: 'kube-state-metrics'
+              static_configs:
+                - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
+              metric_relabel_configs:
+                - target_label: k8s.cluster.name
+                  replacement: "${env:CLUSTER_NAME}"
+                - { source_labels: [deployment], target_label: k8s.deployment.name, regex: (.+) }
+                - { source_labels: [pod], target_label: k8s.pod.name, regex: (.+) }
+                - { source_labels: [node], target_label: k8s.node.name, regex: (.+) }
+
+      # OTLP receiver for app traces (Java/Python/Node OTel agents → port 4317)
+      otlp:
+        protocols:
+          grpc: { endpoint: "0.0.0.0:4317" }
+          http: { endpoint: "0.0.0.0:4318" }
+
+      # Linkerd 2.19+ proxy traces arrive on the same port 4317 as app traces —
+      # no separate receiver needed. See header comment for how to enable.
+
+      # LOGS: tail node pod logs via the CRI log path.
+      # The `container` operator parses CRI format and extracts k8s metadata from the file path.
+      filelog:
+        include: [ /var/log/pods/*/*/*.log ]
+        include_file_path: true
+        start_at: end
+        operators:
+          - type: container
+            add_metadata_from_filepath: true
+
+    processors:
+      memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
+
+      # Enrich logs with pod owner metadata (k8s.deployment.name) and Linkerd pod labels
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata: [ k8s.deployment.name, k8s.node.name ]
+          labels:
+            - { tag_name: linkerd.io/proxy-deployment, key: linkerd.io/proxy-deployment, from: pod }
+            - { tag_name: linkerd_control_plane_ns, key: linkerd.io/control-plane-ns, from: pod }
+            - { tag_name: linkerd_control_plane_component, key: linkerd.io/control-plane-component, from: pod }
+        pod_association:
+          - sources:
+              - { from: resource_attribute, name: k8s.pod.name }
+              - { from: resource_attribute, name: k8s.namespace.name }
+
+      # Enrich spans with k8s metadata from pod labels (linkerd_control_plane_ns required
+      # for the EXT:SERVICE → OPERATES_IN → EXT:LINKERD relationship rule)
+      k8sattributes/traces:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata: [ k8s.deployment.name, k8s.node.name, k8s.namespace.name, k8s.pod.name ]
+          labels:
+            - { tag_name: linkerd.io/proxy-deployment, key: linkerd.io/proxy-deployment, from: pod }
+            - { tag_name: linkerd_control_plane_ns, key: linkerd.io/control-plane-ns, from: pod }
+            - { tag_name: linkerd_control_plane_component, key: linkerd.io/control-plane-component, from: pod }
+        pod_association:
+          # k8s.pod.ip set via downward API env var in the app pod (see APM setup)
+          - sources: [{ from: resource_attribute, name: k8s.pod.ip }]
+          - sources: [{ from: connection }]
+
+      # Keep only linkerd-proxy container logs from app pods; keep all logs from CP pods
+      filter/onlyproxy:
+        error_mode: ignore
+        logs:
+          log_record:
+            - 'resource.attributes["k8s.container.name"] != "linkerd-proxy" and not IsMatch(resource.attributes["linkerd_control_plane_component"], ".+")'
+
+      resource/cluster:
+        attributes:
+          - { key: k8s.cluster.name, value: "${env:CLUSTER_NAME}", action: upsert }
+
+      # Strip service.name from Prometheus metrics to prevent spurious EXT:SERVICE entities
+      resource/strip_service:
+        attributes:
+          - { key: service.name, action: delete }
+          - { key: service.instance.id, action: delete }
+
+      # Cloud-specific resource detection — uncomment ONE block matching your environment
+      resourcedetection:
+        detectors: [env]
+        # --- EKS ---
+        # detectors: [env, eks]
+        # --- GKE ---
+        # detectors: [env, gke]
+        # --- AKS ---
+        # detectors: [env, azure]
+        # --- Generic / self-managed K8s ---
+        # detectors: [env, system]
+        override: false
+
+      # Copy Prometheus label namespace → k8s.namespace.name (needed for entity synthesis
+      # and the EXT:LINKERD MANAGES KUBERNETES_DEPLOYMENT relationship rule)
+      transform/k8s:
+        metric_statements:
+          - context: datapoint
+            statements:
+              - set(attributes["k8s.namespace.name"], attributes["namespace"]) where attributes["namespace"] != nil
+              - set(attributes["k8s.pod.name"], attributes["pod"]) where attributes["pod"] != nil
+              - delete_key(attributes, "instance")
+
+      # Derive k8s.deployment.name from pod name (strips <rs-hash>-<pod-suffix>)
+      transform/deployment:
+        metric_statements:
+          - context: datapoint
+            statements:
+              - set(attributes["k8s.deployment.name"], attributes["k8s.pod.name"]) where attributes["k8s.deployment.name"] == nil and attributes["k8s.pod.name"] != nil
+              - replace_pattern(attributes["k8s.deployment.name"], "-[a-z0-9]+-[a-z0-9]+$", "") where attributes["k8s.deployment.name"] == attributes["k8s.pod.name"]
+
+      # Strip metric descriptions and units to reduce ingest volume
+      transform/metadata_nullify:
+        metric_statements:
+          - context: metric
+            statements:
+              - set(description, "")
+              - set(unit, "")
+
+      # Copy http.server.request.duration → apm.service.transaction.duration so NR APM
+      # golden metrics (throughput, response time) appear for OTel-instrumented services
+      metricstransform/apm_compat:
+        transforms:
+          - include: http.server.request.duration
+            action: insert
+            new_name: apm.service.transaction.duration
+
+      # Rename service.name=linkerd-proxy → deployment name on spans.
+      # Prevents a spurious APM:SERVICE(linkerd-proxy) entity in NR.
+      transform/linkerd_service_name:
+        trace_statements:
+          - context: resource
+            statements:
+              - set(attributes["service.name"], attributes["k8s.deployment.name"])
+                where attributes["service.name"] == "linkerd-proxy"
+                and attributes["k8s.deployment.name"] != nil
+
+      batch: {}
+
+    exporters:
+      otlphttp:
+        endpoint: "${env:YOUR_NEWRELIC_OTLP_ENDPOINT}"
+        headers:
+          api-key: "${env:YOUR_NEW_RELIC_LICENSE_KEY}"
+
+    service:
+      pipelines:
+        # Linkerd proxy + kube-state-metrics: strip service.name to avoid spurious entities
+        metrics/prometheus:
+          receivers: [prometheus]
+          processors: [memory_limiter, resource/cluster, resource/strip_service, resourcedetection, transform/k8s, transform/deployment, transform/metadata_nullify, batch]
+          exporters: [otlphttp]
+
+        # App OTLP metrics (OTel SDK): preserve service.name for APM golden metrics
+        metrics/otlp:
+          receivers: [otlp]
+          processors: [memory_limiter, resource/cluster, resourcedetection, transform/metadata_nullify, metricstransform/apm_compat, batch]
+          exporters: [otlphttp]
+
+        # App traces + Linkerd proxy traces (2.19+) both arrive on port 4317
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes/traces, resource/cluster, transform/linkerd_service_name, batch]
+          exporters: [otlphttp]
+
+        logs:
+          receivers: [filelog]
+          processors: [memory_limiter, k8sattributes, resource/cluster, filter/onlyproxy, batch]
+          exporters: [otlphttp]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: nr-otel-collector, namespace: nr-otel }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: nr-otel-collector } }
+  template:
+    metadata:
+      labels: { app: nr-otel-collector }
+      annotations:
+        linkerd.io/inject: enabled
+    spec:
+      serviceAccountName: nr-otel-collector
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.119.0
+          args: ["--config=/etc/otel/config.yaml"]
+          env:
+            # !! SET THIS to your cluster name !!
+            - { name: CLUSTER_NAME, value: "<YOUR_CLUSTER_NAME>" }
+            - name: YOUR_NEWRELIC_OTLP_ENDPOINT
+              valueFrom: { secretKeyRef: { name: nr-license, key: NEWRELIC_OTLP_ENDPOINT } }
+            - name: YOUR_NEW_RELIC_LICENSE_KEY
+              valueFrom: { secretKeyRef: { name: nr-license, key: NEW_RELIC_LICENSE_KEY } }
+          ports:
+            - { name: otlp-grpc, containerPort: 4317, protocol: TCP }
+            - { name: otlp-http, containerPort: 4318, protocol: TCP }
+          # Required to read /var/log/pods (root-owned on most distributions)
+          securityContext: { runAsUser: 0 }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits:   { cpu: 1000m, memory: 1Gi }
+          volumeMounts:
+            - { name: cfg, mountPath: /etc/otel }
+            # CRI log path — present on ALL runtimes (containerd, Docker, CRI-O)
+            - { name: varlogpods, mountPath: /var/log/pods, readOnly: true }
+            # Docker only: symlink target for /var/log/pods entries.
+            # Uncomment if your nodes use Docker (uncommon in managed clusters).
+            # - { name: varlibdockercontainers, mountPath: /var/lib/docker/containers, readOnly: true }
+      volumes:
+        - { name: cfg, configMap: { name: nr-otel-config } }
+        # Present on ALL container runtimes
+        - { name: varlogpods, hostPath: { path: /var/log/pods } }
+        # Docker only — uncomment if needed
+        # - { name: varlibdockercontainers, hostPath: { path: /var/lib/docker/containers } }
+---
+# Service — appProtocol: grpc is required so Linkerd routes OTLP gRPC correctly.
+# Without it, Linkerd treats port 4317 as HTTP/1.1 and gRPC export fails.
+apiVersion: v1
+kind: Service
+metadata: { name: nr-otel-collector, namespace: nr-otel }
+spec:
+  selector: { app: nr-otel-collector }
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317, protocol: TCP, appProtocol: grpc }
+    - { name: otlp-http, port: 4318, targetPort: 4318, protocol: TCP }
