@@ -129,13 +129,13 @@ kubectl -n nr-otel create secret generic nr-license \
 
 ### 4b — Apply the collector manifest
 
-Use `otel-collector-production.yaml` for all deployments.
+Use `otel-collector.yaml` for all deployments.
 
 ```bash
 # 1. Set your cluster name in the OTEL_RESOURCE_ATTRIBUTES env var in the Deployment
 #    (see inline comments in the file)
 # 2. Apply
-kubectl apply -f otel-force-runs/linkerd/otel-collector-production.yaml
+kubectl apply -f otel-force-runs/linkerd/otel-collector.yaml
 kubectl rollout status deployment/nr-otel-collector -n nr-otel
 ```
 
@@ -169,7 +169,7 @@ kubectl rollout status deployment/nr-otel-collector -n nr-otel
 > **Important processors for APM correctness:**
 > - `transform/linkerd_service_name` — without this, every Linkerd sidecar creates a spurious `APM:SERVICE(linkerd-proxy)` entity
 > - `metricstransform/apm_compat` — without this, OTel SDK HTTP duration metrics don't appear in NR APM views
-> Both are included in `otel-collector-production.yaml`.
+> Both are included in `otel-collector.yaml`.
 
 ---
 
@@ -510,7 +510,7 @@ no port 5317, no extra TLS setup required.
 
 > **Note:** The `meshIdentity` stanza is **mandatory**. Linkerd can only export traces
 > to a collector that is inside the mesh. The collector pod must have
-> `linkerd.io/inject: enabled` (already set in `otel-collector-production.yaml`).
+> `linkerd.io/inject: enabled` (already set in `otel-collector.yaml`).
 
 **Step 1 — Enable tracing in Linkerd:**
 
@@ -559,7 +559,7 @@ Reference: [Linkerd Distributed Tracing docs](https://linkerd.io/2.19/tasks/dist
 
 | File | Purpose |
 |---|---|
-| `otel-collector-production.yaml` | OTel Collector manifest — metrics, traces, logs |
+| `otel-collector.yaml` | OTel Collector manifest — metrics, traces, logs |
 | `SETUP.md` | This document |
 
 ---
