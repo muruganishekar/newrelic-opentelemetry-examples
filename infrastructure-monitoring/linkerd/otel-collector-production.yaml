@@ -1,39 +1,4 @@
-# OTel Collector for Linkerd -> New Relic (Production)
-#
-# BEFORE APPLYING:
-#   1. Create the namespace and license secret:
-#
-#      kubectl create namespace nr-otel
-#
-#      kubectl -n nr-otel create secret generic nr-license \
-#        --from-literal=NEW_RELIC_LICENSE_KEY='<YOUR_NR_INGEST_LICENSE_KEY>' \
-#        --from-literal=NEWRELIC_OTLP_ENDPOINT='https://otlp.nr-data.net:443'
-#        # EU:      https://otlp.eu01.nr-data.net:443
-#
-#   2. Set your cluster name in the Deployment env section below:
-#              - { name: OTEL_RESOURCE_ATTRIBUTES, value: "k8s.cluster.name=<your-cluster>" }
-#      The `env` resourcedetection detector reads OTEL_RESOURCE_ATTRIBUTES automatically.
-#      Works on ALL cluster types (EKS, GKE, AKS, self-managed) — no IAM permissions needed.
-#      For additional cloud attributes (cloud.provider, cloud.region), optionally add:
-#              detectors: [env, eks]   # EKS — needs ec2:DescribeInstances IAM permission
-#              detectors: [env, gke]   # GKE
-#              detectors: [env, azure] # AKS
-#
-#   3. Docker runtime only: uncomment the /var/lib/docker/containers volume/mount below.
-#
-# NOTE — Linkerd proxy trace export (Linkerd 2.19+):
-#   Linkerd proxy traces are sent to port 4317 through the mesh (no cert-manager needed).
-#   To enable after applying this manifest:
-#
-#     linkerd upgrade \
-#       --set proxy.tracing.enabled=true \
-#       --set proxy.tracing.collector.endpoint=nr-otel-collector.nr-otel.svc.cluster.local:4317 \
-#       --set proxy.tracing.collector.meshIdentity.serviceAccountName=nr-otel-collector \
-#       --set proxy.tracing.collector.meshIdentity.namespace=nr-otel \
-#       | kubectl apply -f -
-#
-#   Then restart all meshed pods and ensure apps propagate w3c/b3 trace headers.
-#   See: https://linkerd.io/2.19/tasks/distributed-tracing/
+# OTel Collector for Linkerd -> New Relic (Production). See SETUP.md for full setup instructions.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -66,7 +31,6 @@ data:
       prometheus:
         config:
           scrape_configs:
-            # Scrape Linkerd control plane component metrics (destination, identity, proxy-injector)
             - job_name: 'linkerd-controller'
               kubernetes_sd_configs:
                 - role: pod
@@ -77,7 +41,6 @@ data:
                 - { source_labels: [__meta_kubernetes_namespace], target_label: namespace }
                 - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
 
-            # Scrape Linkerd proxy sidecar metrics from ALL meshed pods (:4191 admin port)
             - job_name: 'linkerd-proxy'
               kubernetes_sd_configs: [{ role: pod }]
               relabel_configs:
@@ -99,16 +62,13 @@ data:
                 - { source_labels: [pod], target_label: k8s.pod.name, regex: (.+) }
                 - { source_labels: [node], target_label: k8s.node.name, regex: (.+) }
 
-      # OTLP receiver for app traces (Java/Python/Node OTel agents → port 4317)
       otlp:
         protocols:
           grpc: { endpoint: "0.0.0.0:4317" }
           http: { endpoint: "0.0.0.0:4318" }
 
-      # Linkerd 2.19+ proxy traces arrive on the same port 4317 as app traces —
-      # no separate receiver needed. See header comment for how to enable.
+      # Linkerd 2.19+ proxy traces arrive on port 4317 — no separate receiver needed. See SETUP.md.
 
-      # LOGS: tail node pod logs via the CRI log path.
       filelog:
         include: [ /var/log/pods/*/*/*.log ]
         include_file_path: true
@@ -120,7 +80,6 @@ data:
     processors:
       memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
 
-      # Enrich logs with pod owner metadata (k8s.deployment.name) and Linkerd pod labels
       k8sattributes:
         auth_type: serviceAccount
         passthrough: false
@@ -150,7 +109,6 @@ data:
           - sources: [{ from: resource_attribute, name: k8s.pod.ip }]
           - sources: [{ from: connection }]
 
-      # Keep only linkerd-proxy container logs from app pods; keep all logs from CP pods
       filter/onlyproxy:
         error_mode: ignore
         logs:
@@ -163,12 +121,9 @@ data:
           - { key: service.name, action: delete }
           - { key: service.instance.id, action: delete }
 
-      # Resource detection — reads cloud metadata and the OTEL_RESOURCE_ATTRIBUTES env var.
-      # k8s.cluster.name is set via OTEL_RESOURCE_ATTRIBUTES in the Deployment (see below).
-      # Optionally add cloud-specific detectors to also get cloud.provider, cloud.region, etc:
+      # Optional: add cloud-specific detectors for cloud.provider/cloud.region:
       #   EKS (requires ec2:DescribeInstances IAM): detectors: [env, eks]
-      #   GKE:   detectors: [env, gke]
-      #   AKS:   detectors: [env, azure]
+      #   GKE: detectors: [env, gke]   AKS: detectors: [env, azure]
       resourcedetection:
         detectors: [env]
         override: false
