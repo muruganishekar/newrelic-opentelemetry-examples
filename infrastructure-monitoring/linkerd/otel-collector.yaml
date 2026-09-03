@@ -94,8 +94,9 @@ data:
               - { from: resource_attribute, name: k8s.pod.name }
               - { from: resource_attribute, name: k8s.namespace.name }
 
-      # Enrich spans with k8s metadata from pod labels (linkerd_control_plane_ns required
-      # for the EXT:SERVICE → OPERATES_IN → EXT:LINKERD relationship rule)
+      # Enrich spans with k8s metadata from pod labels.
+      # linkerd_control_plane_ns + linkerd_control_plane_component required for
+      # the ext_linkerd_otel_span_staging synthesis rule (Span → EXT:LINKERD entity).
       k8sattributes/traces:
         auth_type: serviceAccount
         passthrough: false
@@ -161,6 +162,17 @@ data:
             action: insert
             new_name: apm.service.transaction.duration
 
+      # Mark ALL Linkerd proxy sidecar spans with linkerd_control_plane_component so the
+      # ext_linkerd_otel_span_staging synthesis rule resolves them to EXT:LINKERD.
+      # Must run BEFORE transform/linkerd_service_name (uses service.name == "linkerd-proxy").
+      transform/linkerd_component_inject:
+        trace_statements:
+          - context: span
+            statements:
+              - set(attributes["linkerd_control_plane_component"], "linkerd-proxy")
+                where resource.attributes["service.name"] == "linkerd-proxy"
+                and resource.attributes["linkerd_control_plane_ns"] != nil
+
       # Rename service.name=linkerd-proxy → deployment name on spans.
       # Prevents a spurious APM:SERVICE(linkerd-proxy) entity in NR.
       transform/linkerd_service_name:
@@ -194,9 +206,10 @@ data:
           exporters: [otlphttp]
 
         # App traces + Linkerd proxy traces (2.19+) both arrive on port 4317
+        # inject MUST run before rename (rename destroys the service.name condition)
         traces:
           receivers: [otlp]
-          processors: [memory_limiter, k8sattributes/traces, resourcedetection, transform/linkerd_service_name, batch]
+          processors: [memory_limiter, k8sattributes/traces, resourcedetection, transform/linkerd_component_inject, transform/linkerd_service_name, batch]
           exporters: [otlphttp]
 
         logs:

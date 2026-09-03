@@ -42,22 +42,49 @@ collector config to point at the correct namespace.
 
 ## Step 1 — Install Linkerd
 
+### Via Helm (recommended)
+
+Helm requires explicit certificates. Generate them with the [`step` CLI](https://smallstep.com/docs/step-cli/installation/):
+
 ```bash
-# Install Gateway API CRDs (required by Linkerd edge/2.x)
+helm repo add linkerd https://helm.linkerd.io/stable
+helm repo update
+
+# Gateway API CRDs (required by Linkerd)
 kubectl apply --server-side \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
 
-# Install Linkerd CRDs
+# Generate trust anchor + issuer certs
+step certificate create root.linkerd.cluster.local ca.crt ca.key \
+  --profile root-ca --no-password --insecure
+step certificate create identity.linkerd.cluster.local issuer.crt issuer.key \
+  --profile intermediate-ca --not-after 8760h --no-password --insecure \
+  --ca ca.crt --ca-key ca.key
+
+# Install Linkerd CRDs, then control plane
+helm install linkerd-crds linkerd/linkerd-crds \
+  --namespace linkerd --create-namespace
+
+helm install linkerd-control-plane linkerd/linkerd-control-plane \
+  --namespace linkerd \
+  --set-file identityTrustAnchorsPEM=ca.crt \
+  --set identity.issuer.tls.crtPEM="$(cat issuer.crt)" \
+  --set identity.issuer.tls.keyPEM="$(cat issuer.key)"
+  # Docker-based runtimes — add: --set proxyInit.runAsRoot=true
+
+linkerd check
+```
+
+### Alternative — Linkerd CLI (auto-generates certificates)
+
+```bash
+kubectl apply --server-side \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+
 linkerd install --crds | kubectl apply -f -
-
-# Install Linkerd control plane
-# Standard clusters:
 linkerd install | kubectl apply -f -
+# Docker-based runtimes: linkerd install --set proxyInit.runAsRoot=true | kubectl apply -f -
 
-# Docker-based runtimes — proxy-init needs root:
-linkerd install --set proxyInit.runAsRoot=true | kubectl apply -f -
-
-# Verify — all checks must pass before proceeding
 linkerd check
 ```
 
@@ -68,6 +95,20 @@ linkerd check
 kube-state-metrics provides Kubernetes object metrics that NR uses to synthesise
 `KUBERNETES_DEPLOYMENT`, `KUBERNETES_POD`, and `KUBERNETES_NAMESPACE` entities.
 
+### Via Helm (recommended)
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install kube-state-metrics prometheus-community/kube-state-metrics \
+  --namespace kube-system --create-namespace
+```
+
+The Helm chart creates the Service on port 8080 automatically — no extra step needed.
+
+### Alternative — kubectl
+
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/kube-state-metrics/main/examples/standard/service-account.yaml
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/kube-state-metrics/main/examples/standard/cluster-role.yaml
@@ -75,7 +116,7 @@ kubectl apply -f https://raw.githubusercontent.com/kubernetes/kube-state-metrics
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/kube-state-metrics/main/examples/standard/deployment.yaml
 ```
 
-Create the Service so the OTel Collector can scrape it:
+Then create the Service so the OTel Collector can scrape it:
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -161,15 +202,17 @@ kubectl rollout status deployment/nr-otel-collector -n nr-otel
 | `linkerd-proxy` scrape job | Scrapes every meshed pod's proxy sidecar on `:4191` |
 | `kube-state-metrics` scrape job | Scrapes K8s object metrics for entity synthesis |
 | `otlp` receiver `:4317` | Receives app traces from OTel Java/Python/Node agents |
-| `k8sattributes/traces` | Enriches spans with `linkerd_control_plane_ns` from pod labels — **required** for `EXT:SERVICE → OPERATES_IN → EXT:LINKERD` relationship |
+| `k8sattributes/traces` | Enriches spans with `linkerd_control_plane_ns` + `linkerd_control_plane_component` from pod labels — **required** for span-based `EXT:LINKERD` entity synthesis |
+| `transform/linkerd_component_inject` | Stamps `linkerd_control_plane_component` on all Linkerd proxy spans so the span synthesis rule resolves them to `EXT:LINKERD` — **required** for APM relationships |
 | `transform/linkerd_service_name` | Renames `service.name=linkerd-proxy` → deployment name — **required** to prevent a spurious `linkerd-proxy` APM entity |
 | `metricstransform/apm_compat` | Renames `http.server.request.duration` → `apm.service.transaction.duration` for NR APM compatibility |
 | `filelog` receiver | Tails Linkerd proxy container logs |
 
 > **Important processors for APM correctness:**
+> - `transform/linkerd_component_inject` — without this, proxy spans land on a generic `EXT:SERVICE` instead of `EXT:LINKERD`
 > - `transform/linkerd_service_name` — without this, every Linkerd sidecar creates a spurious `APM:SERVICE(linkerd-proxy)` entity
 > - `metricstransform/apm_compat` — without this, OTel SDK HTTP duration metrics don't appear in NR APM views
-> Both are included in `otel-collector.yaml`.
+> All three are included in `otel-collector.yaml`.
 
 ---
 
@@ -358,7 +401,7 @@ SINCE 5 minutes ago LIMIT 1
 - Error stack traces — not just "500 happened" but the Java exception and line
 - `EXT:SERVICE` entity in NR with service map
 - `EXT:SERVICE → CALLS → EXT:SERVICE` relationship from distributed traces
-- `EXT:SERVICE → OPERATES_IN → EXT:LINKERD` relationship (mesh membership)
+- `EXT:LINKERD` entity visible in APM service map via span-based synthesis
 
 ---
 
@@ -372,7 +415,6 @@ INFRA:KUBERNETESCLUSTER (<cluster-name>)
                     └── MANAGES → INFRA:KUBERNETES_DEPLOYMENT (each meshed workload)
 
 EXT:SERVICE (<app-name>)   ← APM only
-  ├── OPERATES_IN → EXT:LINKERD (<cluster-name>-linkerd)
   └── CALLS → EXT:SERVICE (<downstream-app-name>)
 ```
 
